@@ -14,9 +14,6 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
 app.use(express.raw({ type: "application/json" }));
 
-// ============================================================
-// TOKEN
-// ============================================================
 let cachedToken = null;
 let tokenVerlooptOp = null;
 
@@ -40,9 +37,6 @@ async function haalToken() {
   return cachedToken;
 }
 
-// ============================================================
-// HELPERS
-// ============================================================
 function maakNaam(titel) {
   return titel.trim().replace(/\s+/g, "-").replace(/[^a-zA-Z0-9\-]/g, "").replace(/-+/g, "-");
 }
@@ -66,9 +60,6 @@ async function graphql(query, variables, token) {
   return data;
 }
 
-// ============================================================
-// STAP 1: Foto's ophalen van product inclusief alt tag
-// ============================================================
 async function haalFotos(productId, token) {
   const data = await graphql(`
     query($id: ID!) {
@@ -92,9 +83,6 @@ async function haalFotos(productId, token) {
   return data.data?.product;
 }
 
-// ============================================================
-// STAP 2: Alt tag aanpassen
-// ============================================================
 async function pasAltAan(productId, mediaId, naam, token) {
   const data = await graphql(`
     mutation($productId: ID!, $media: [UpdateMediaInput!]!) {
@@ -104,25 +92,17 @@ async function pasAltAan(productId, mediaId, naam, token) {
       }
     }
   `, { productId, media: [{ id: mediaId, alt: naam }] }, token);
-
   const fouten = data.data?.productUpdateMedia?.mediaUserErrors || [];
-  if (fouten.length > 0) {
-    console.log(`  ❌ Alt tag fout: ${fouten[0].message}`);
-    return false;
-  }
+  if (fouten.length > 0) { console.log(`  ❌ Alt tag fout: ${fouten[0].message}`); return false; }
   console.log(`  ✅ Alt tag: "${naam}"`);
   return true;
 }
 
-// ============================================================
-// STAP 3: Bestandsnaam aanpassen
-// ============================================================
 async function pasBestandsnaamAan(mediaId, naam, mimeType, token) {
   let ext = ".jpg";
   if (mimeType === "image/png") ext = ".png";
   else if (mimeType === "image/webp") ext = ".webp";
   else if (mimeType === "image/gif") ext = ".gif";
-
   const data = await graphql(`
     mutation($files: [FileUpdateInput!]!) {
       fileUpdate(files: $files) {
@@ -131,92 +111,53 @@ async function pasBestandsnaamAan(mediaId, naam, mimeType, token) {
       }
     }
   `, { files: [{ id: mediaId, filename: `${naam}${ext}` }] }, token);
-
   const fouten = data.data?.fileUpdate?.userErrors || [];
-  if (fouten.length > 0) {
-    console.log(`  ❌ Bestandsnaam fout: ${fouten[0].message} (${fouten[0].code})`);
-    return false;
-  }
+  if (fouten.length > 0) { console.log(`  ❌ Bestandsnaam fout: ${fouten[0].message} (${fouten[0].code})`); return false; }
   console.log(`  ✅ Bestandsnaam: "${naam}${ext}"`);
   return true;
 }
 
-// ============================================================
-// HOOFDFUNCTIE
-// ============================================================
 async function verwerk(productData) {
   const productId = `gid://shopify/Product/${productData.id}`;
   const titel = productData.title;
   const naam = maakNaam(titel);
-
   console.log(`\n🛍️  Product: "${titel}"`);
   console.log(`📝 Wordt: "${naam}"`);
-
   const token = await haalToken();
-
-  // Wacht 3 seconden zodat Shopify foto's verwerkt heeft
   await new Promise(r => setTimeout(r, 3000));
-
   const product = await haalFotos(productId, token);
   if (!product) { console.log("❌ Product niet gevonden"); return; }
-
   const fotos = product.media?.edges || [];
   console.log(`📸 ${fotos.length} foto('s) gevonden`);
-  if (fotos.length === 0) { console.log("ℹ️  Geen foto's — wordt opgepakt zodra foto's worden toegevoegd"); return; }
-
+  if (fotos.length === 0) { console.log("ℹ️  Geen foto's"); return; }
   let gelukt = 0;
   let overgeslagen = 0;
-
   for (const { node: foto } of fotos) {
     if (foto.mediaContentType !== "IMAGE") continue;
-
     console.log(`\n  🖼️  Foto: ${foto.id}`);
     console.log(`  📌 Huidige alt tag: "${foto.alt || "(leeg)"}"`);
-
-    // ============================================================
-    // SLIMME CHECK: alleen foto's zonder alt tag worden aangepast
-    // Als een foto al een alt tag heeft → is hij al eerder verwerkt
-    // of wordt hij door meerdere producten gebruikt → overslaan!
-    // ============================================================
     if (foto.alt && foto.alt.trim() !== "") {
       console.log(`  ⏭️  Overgeslagen — heeft al een alt tag`);
       overgeslagen++;
       continue;
     }
-
     await pasAltAan(productId, foto.id, naam, token);
     await pasBestandsnaamAan(foto.id, naam, foto.mimeType, token);
     gelukt++;
   }
-
   console.log(`\n🎉 ${gelukt} bijgewerkt, ${overgeslagen} overgeslagen voor "${titel}"`);
 }
 
-// ============================================================
-// WEBHOOKS
-// ============================================================
 app.post("/webhook/product-created", async (req, res) => {
-  if (!isEchtShopify(req.body, req.headers["x-shopify-hmac-sha256"])) {
-    return res.status(401).send("Ongeautoriseerd");
-  }
+  if (!isEchtShopify(req.body, req.headers["x-shopify-hmac-sha256"])) return res.status(401).send("Ongeautoriseerd");
   res.status(200).send("Ontvangen!");
-  try {
-    await verwerk(JSON.parse(req.body.toString()));
-  } catch (e) {
-    console.error("❌ Fout:", e.message);
-  }
+  try { await verwerk(JSON.parse(req.body.toString())); } catch (e) { console.error("❌ Fout:", e.message); }
 });
 
 app.post("/webhook/product-updated", async (req, res) => {
-  if (!isEchtShopify(req.body, req.headers["x-shopify-hmac-sha256"])) {
-    return res.status(401).send("Ongeautoriseerd");
-  }
+  if (!isEchtShopify(req.body, req.headers["x-shopify-hmac-sha256"])) return res.status(401).send("Ongeautoriseerd");
   res.status(200).send("Ontvangen!");
-  try {
-    await verwerk(JSON.parse(req.body.toString()));
-  } catch (e) {
-    console.error("❌ Fout:", e.message);
-  }
+  try { await verwerk(JSON.parse(req.body.toString())); } catch (e) { console.error("❌ Fout:", e.message); }
 });
 
 app.get("/", (req, res) => {
