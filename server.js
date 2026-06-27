@@ -1,6 +1,6 @@
 // ============================================================
-// Sportbrillenshop - Automatische Alt Tag + Bestandsnaam Updater
-// Versie 7 - definitieve versie met correcte gedeelde foto check
+// Sportbrillenshop - Alt Tag + Bestandsnaam Updater
+// Versie 8 - met uitgebreide logging voor references debug
 // ============================================================
 
 const express = require("express");
@@ -15,15 +15,13 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 app.use(express.raw({ type: "application/json" }));
 
 // ============================================================
-// TOEGANGSTOKEN
+// TOKEN
 // ============================================================
 let cachedToken = null;
 let tokenVerlooptOp = null;
 
 async function haalToken() {
-  if (cachedToken && tokenVerlooptOp && new Date() < tokenVerlooptOp) {
-    return cachedToken;
-  }
+  if (cachedToken && tokenVerlooptOp && new Date() < tokenVerlooptOp) return cachedToken;
   console.log("🔑 Token ophalen...");
   const res = await fetch(`https://${SHOPIFY_SHOP_DOMAIN}/admin/oauth/access_token`, {
     method: "POST",
@@ -69,8 +67,7 @@ async function graphql(query, variables, token) {
 }
 
 // ============================================================
-// STAP 1: Haal foto's op van product
-// We halen hier het MEDIA id op (gid://shopify/MediaImage/...)
+// STAP 1: Foto's ophalen van product
 // ============================================================
 async function haalFotos(productId, token) {
   const data = await graphql(`
@@ -96,33 +93,24 @@ async function haalFotos(productId, token) {
 }
 
 // ============================================================
-// STAP 2: Controleer hoeveel producten deze foto gebruiken
-// We zoeken in alle producten naar dit media ID
-// Als de foto bij meer dan 1 product voorkomt → overslaan
+// STAP 2: Controleer references - MET VOLLEDIGE LOGGING
 // ============================================================
-async function isGedeeldeFoto(mediaId, huidigProductId, token) {
-  // Haal het numerieke ID op uit het GID
-  // gid://shopify/MediaImage/123456 → 123456
-  const numeriekId = mediaId.split("/").pop();
-
-  // Zoek in Shopify naar alle producten die een afbeelding hebben met dit ID
-  // We gebruiken de files query met het specifieke media ID
+async function isGedeeldeFoto(mediaId, token) {
   const data = await graphql(`
     query($id: ID!) {
       node(id: $id) {
-        id
         ... on MediaImage {
           id
-          alt
-          fileStatus
           references(first: 25) {
             nodes {
+              __typename
               ... on Product {
                 id
                 title
               }
               ... on ProductVariant {
                 id
+                title
                 product {
                   id
                   title
@@ -135,23 +123,22 @@ async function isGedeeldeFoto(mediaId, huidigProductId, token) {
     }
   `, { id: mediaId }, token);
 
-  const refs = data.data?.node?.references?.nodes || [];
+  const nodes = data.data?.node?.references?.nodes || [];
   
-  // Tel unieke product IDs
+  // Log alles wat Shopify teruggeeft — zo zien we precies wat er gebeurt
+  console.log(`  🔍 References ruwe data: ${JSON.stringify(nodes)}`);
+
+  // Verzamel unieke product IDs
   const productIds = new Set();
-  
-  for (const ref of refs) {
-    if (ref.id?.includes("gid://shopify/Product/")) {
-      productIds.add(ref.id);
-    } else if (ref.product?.id) {
-      // ProductVariant referentie
-      productIds.add(ref.product.id);
+  for (const node of nodes) {
+    if (node.__typename === "Product") {
+      productIds.add(node.id);
+    } else if (node.__typename === "ProductVariant" && node.product?.id) {
+      productIds.add(node.product.id);
     }
   }
 
-  console.log(`  🔍 Foto gevonden bij ${productIds.size} product(en)`);
-
-  // Als meer dan 1 → gedeeld
+  console.log(`  🔍 Unieke producten: ${productIds.size} → ${JSON.stringify([...productIds])}`);
   return productIds.size > 1;
 }
 
@@ -179,7 +166,6 @@ async function pasAltAan(productId, mediaId, naam, token) {
 
 // ============================================================
 // STAP 4: Bestandsnaam aanpassen
-// Vereist write_files scope!
 // ============================================================
 async function pasBestandsnaamAan(mediaId, naam, mimeType, token) {
   let ext = ".jpg";
@@ -198,7 +184,7 @@ async function pasBestandsnaamAan(mediaId, naam, mimeType, token) {
 
   const fouten = data.data?.fileUpdate?.userErrors || [];
   if (fouten.length > 0) {
-    console.log(`  ❌ Bestandsnaam fout: ${fouten[0].message} (code: ${fouten[0].code})`);
+    console.log(`  ❌ Bestandsnaam fout: ${fouten[0].message} (${fouten[0].code})`);
     return false;
   }
   console.log(`  ✅ Bestandsnaam: "${naam}${ext}"`);
@@ -213,12 +199,12 @@ async function verwerk(productData) {
   const titel = productData.title;
   const naam = maakNaam(titel);
 
-  console.log(`\n🛍️  Product: "${titel}"`);
+  console.log(`\n🛍️  Product: "${titel}" (${productId})`);
   console.log(`📝 Wordt: "${naam}"`);
 
   const token = await haalToken();
 
-  // Wacht 5 seconden — Shopify heeft tijd nodig om foto's te verwerken
+  // Wacht 5 seconden zodat Shopify foto's verwerkt heeft
   await new Promise(r => setTimeout(r, 5000));
 
   const product = await haalFotos(productId, token);
@@ -234,30 +220,25 @@ async function verwerk(productData) {
   for (const { node: foto } of fotos) {
     if (foto.mediaContentType !== "IMAGE") continue;
 
-    console.log(`\n  🖼️  Foto ID: ${foto.id}`);
+    console.log(`\n  🖼️  Foto: ${foto.id}`);
 
-    // Check of foto gedeeld is met andere producten
-    const gedeeld = await isGedeeldeFoto(foto.id, productId, token);
+    const gedeeld = await isGedeeldeFoto(foto.id, token);
     if (gedeeld) {
-      console.log(`  ⏭️  Overgeslagen — gedeeld met andere producten`);
+      console.log(`  ⏭️  Overgeslagen — gedeeld`);
       overgeslagen++;
       continue;
     }
 
-    // Alt tag aanpassen
     await pasAltAan(productId, foto.id, naam, token);
-
-    // Bestandsnaam aanpassen
     await pasBestandsnaamAan(foto.id, naam, foto.mimeType, token);
-
     gelukt++;
   }
 
-  console.log(`\n🎉 Klaar! ${gelukt} bijgewerkt, ${overgeslagen} overgeslagen voor "${titel}"`);
+  console.log(`\n🎉 ${gelukt} bijgewerkt, ${overgeslagen} overgeslagen voor "${titel}"`);
 }
 
 // ============================================================
-// WEBHOOK ENDPOINT
+// WEBHOOK
 // ============================================================
 app.post("/webhook/product-created", async (req, res) => {
   if (!isEchtShopify(req.body, req.headers["x-shopify-hmac-sha256"])) {
@@ -271,21 +252,19 @@ app.post("/webhook/product-created", async (req, res) => {
   }
 });
 
-// Test-pagina
 app.get("/", (req, res) => {
   res.send(`
-    <h1>✅ Sportbrillenshop Helper werkt!</h1>
-    <p>${SHOPIFY_SHOP_DOMAIN ? "✅" : "❌"} Winkel: ${SHOPIFY_SHOP_DOMAIN || "niet ingesteld"}</p>
+    <h1>✅ Sportbrillenshop Helper v8</h1>
+    <p>${SHOPIFY_SHOP_DOMAIN ? "✅" : "❌"} ${SHOPIFY_SHOP_DOMAIN || "niet ingesteld"}</p>
     <p>${SHOPIFY_CLIENT_ID ? "✅" : "❌"} Client ID</p>
     <p>${SHOPIFY_CLIENT_SECRET ? "✅" : "❌"} Client Secret</p>
-    <h2>Webhook URL:</h2>
     <code>${req.protocol}://${req.get("host")}/webhook/product-created</code>
   `);
 });
 
 const POORT = process.env.PORT || 3000;
 app.listen(POORT, () => {
-  console.log(`\n🚀 Gestart op poort ${POORT}`);
-  console.log(`🏪 ${SHOPIFY_SHOP_DOMAIN || "❌ SHOPIFY_SHOP_DOMAIN niet ingesteld"}`);
-  console.log(`🔑 Client ID: ${SHOPIFY_CLIENT_ID ? "✅" : "❌ niet ingesteld"}\n`);
+  console.log(`\n🚀 v8 gestart op poort ${POORT}`);
+  console.log(`🏪 ${SHOPIFY_SHOP_DOMAIN || "❌ niet ingesteld"}`);
+  console.log(`🔑 ${SHOPIFY_CLIENT_ID ? "✅" : "❌"}\n`);
 });
