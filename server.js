@@ -1,6 +1,6 @@
 // ============================================================
 // Sportbrillenshop - Automatische Alt Tag + Bestandsnaam Updater
-// Versie 5 - fix bestandsnaam + gedeelde foto's correct overslaan
+// Versie 6 - gedeelde foto's correct overslaan via references
 // ============================================================
 
 const express = require("express");
@@ -16,13 +16,6 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 app.use(express.raw({ type: "application/json" }));
 
 // ============================================================
-// GEHEUGEN: bijhouden welke foto's al zijn aangepast
-// Een foto die al eerder is aangepast wordt nooit meer aangeraakt
-// Dit voorkomt dat gedeelde foto's steeds wisselen van naam
-// ============================================================
-const reedsAangepasteFotos = new Set();
-
-// ============================================================
 // TOEGANGSTOKEN OPHALEN
 // ============================================================
 let cachedToken = null;
@@ -32,9 +25,7 @@ async function haalToegangstokenOp() {
   if (cachedToken && tokenVerlooptOp && new Date() < tokenVerlooptOp) {
     return cachedToken;
   }
-
   console.log("🔑 Nieuw toegangstoken ophalen bij Shopify...");
-
   const response = await fetch(
     `https://${SHOPIFY_SHOP_DOMAIN}/admin/oauth/access_token`,
     {
@@ -47,23 +38,19 @@ async function haalToegangstokenOp() {
       }),
     }
   );
-
   if (!response.ok) {
     const fout = await response.text();
     throw new Error(`Token ophalen mislukt: ${fout}`);
   }
-
   const data = await response.json();
   cachedToken = data.access_token;
   tokenVerlooptOp = new Date(Date.now() + 23 * 60 * 60 * 1000);
-
   console.log("✅ Nieuw toegangstoken ontvangen!");
   return cachedToken;
 }
 
 // ============================================================
 // HELPER: Maakt een mooie naam van de producttitel
-// Voorbeeld: "Oakley Jawbreaker Rood" → "Oakley-Jawbreaker-Rood"
 // ============================================================
 function maakNaam(producttitel) {
   return producttitel
@@ -78,12 +65,10 @@ function maakNaam(producttitel) {
 // ============================================================
 function isEchtShopifyBericht(body, handtekening) {
   if (!WEBHOOK_SECRET) return true;
-
   const verwachteHandtekening = crypto
     .createHmac("sha256", WEBHOOK_SECRET)
     .update(body)
     .digest("base64");
-
   try {
     return crypto.timingSafeEqual(
       Buffer.from(handtekening || "", "base64"),
@@ -95,10 +80,28 @@ function isEchtShopifyBericht(body, handtekening) {
 }
 
 // ============================================================
+// GRAPHQL HULPFUNCTIE
+// ============================================================
+async function shopifyGraphQL(query, variables, token) {
+  const response = await fetch(
+    `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2026-01/graphql.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": token,
+      },
+      body: JSON.stringify({ query, variables }),
+    }
+  );
+  return response.json();
+}
+
+// ============================================================
 // STAP 1: Haal alle foto's op van een product
 // ============================================================
 async function haalFotosOp(productId, token) {
-  const query = `
+  const data = await shopifyGraphQL(`
     query getProductMedia($id: ID!) {
       product(id: $id) {
         title
@@ -116,68 +119,67 @@ async function haalFotosOp(productId, token) {
         }
       }
     }
-  `;
-
-  const response = await fetch(
-    `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2026-01/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": token,
-      },
-      body: JSON.stringify({ query, variables: { id: productId } }),
-    }
-  );
-
-  const data = await response.json();
+  `, { id: productId }, token);
   return data.data?.product;
 }
 
 // ============================================================
-// STAP 2: Pas alt tag aan via productUpdateMedia
+// STAP 2: Vraag aan Shopify hoeveel producten deze foto gebruiken
+// Geeft TRUE terug als de foto door meerdere producten wordt gebruikt
 // ============================================================
-async function pasAltTagAan(productId, mediaId, nieuweAltTag, token) {
-  const mutation = `
-    mutation updateMediaAlt($productId: ID!, $media: [UpdateMediaInput!]!) {
-      productUpdateMedia(productId: $productId, media: $media) {
-        media {
+async function wordtDoorMeerdereProductenGebruikt(mediaId, huidigProductId, token) {
+  const data = await shopifyGraphQL(`
+    query checkReferences($id: ID!) {
+      node(id: $id) {
+        ... on MediaImage {
           id
-          alt
-        }
-        mediaUserErrors {
-          field
-          message
+          references(first: 10) {
+            edges {
+              node {
+                ... on Product {
+                  id
+                }
+              }
+            }
+          }
         }
       }
     }
-  `;
+  `, { id: mediaId }, token);
 
-  const response = await fetch(
-    `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2026-01/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": token,
-      },
-      body: JSON.stringify({
-        query: mutation,
-        variables: {
-          productId,
-          media: [{ id: mediaId, alt: nieuweAltTag }],
-        },
-      }),
+  const edges = data.data?.node?.references?.edges || [];
+
+  // Filter alleen echte product-referenties
+  const productIds = edges
+    .map(e => e.node?.id)
+    .filter(id => id && id.includes("gid://shopify/Product/"));
+
+  console.log(`  🔍 Foto gebruikt door ${productIds.length} product(en): ${productIds.join(", ")}`);
+
+  // Als meer dan 1 product → overslaan
+  return productIds.length > 1;
+}
+
+// ============================================================
+// STAP 3: Pas alt tag aan
+// ============================================================
+async function pasAltTagAan(productId, mediaId, nieuweAltTag, token) {
+  const data = await shopifyGraphQL(`
+    mutation updateMediaAlt($productId: ID!, $media: [UpdateMediaInput!]!) {
+      productUpdateMedia(productId: $productId, media: $media) {
+        media { id alt }
+        mediaUserErrors { field message }
+      }
     }
-  );
-
-  const data = await response.json();
+  `, {
+    productId,
+    media: [{ id: mediaId, alt: nieuweAltTag }],
+  }, token);
   return data.data?.productUpdateMedia;
 }
 
 // ============================================================
-// STAP 3: Pas bestandsnaam aan via fileUpdate
-// Vereist write_files scope in de Shopify app!
+// STAP 4: Pas bestandsnaam aan (vereist write_files scope!)
 // ============================================================
 async function pasBestandsnaamAan(mediaId, nieuweNaam, mimeType, token) {
   let extensie = ".jpg";
@@ -185,49 +187,21 @@ async function pasBestandsnaamAan(mediaId, nieuweNaam, mimeType, token) {
   else if (mimeType === "image/webp") extensie = ".webp";
   else if (mimeType === "image/gif") extensie = ".gif";
 
-  const nieuweBestandsnaam = `${nieuweNaam}${extensie}`;
-
-  const mutation = `
+  const data = await shopifyGraphQL(`
     mutation fileUpdate($files: [FileUpdateInput!]!) {
       fileUpdate(files: $files) {
-        files {
-          id
-          ... on MediaImage {
-            image { url }
-          }
-        }
-        userErrors {
-          field
-          message
-          code
-        }
+        files { id }
+        userErrors { field message code }
       }
     }
-  `;
-
-  const response = await fetch(
-    `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2026-01/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": token,
-      },
-      body: JSON.stringify({
-        query: mutation,
-        variables: {
-          files: [{ id: mediaId, filename: nieuweBestandsnaam }],
-        },
-      }),
-    }
-  );
-
-  const data = await response.json();
+  `, {
+    files: [{ id: mediaId, filename: `${nieuweNaam}${extensie}` }],
+  }, token);
   return data.data?.fileUpdate;
 }
 
 // ============================================================
-// HOOFDFUNCTIE: Verwerkt een nieuw/bijgewerkt product
+// HOOFDFUNCTIE
 // ============================================================
 async function verwerkNieuwProduct(productData) {
   const shopifyProductId = `gid://shopify/Product/${productData.id}`;
@@ -263,10 +237,11 @@ async function verwerkNieuwProduct(productData) {
   for (const { node: foto } of fotos) {
     if (foto.mediaContentType !== "IMAGE") continue;
 
-    // Controleer of deze foto al eerder is aangepast
-    // Zo ja: overslaan! Dit beschermt gedeelde foto's
-    if (reedsAangepasteFotos.has(foto.id)) {
-      console.log(`  ⏭️  Foto overgeslagen — al eerder aangepast (gedeelde foto)`);
+    // Vraag aan Shopify of deze foto door meerdere producten wordt gebruikt
+    const gedeeld = await wordtDoorMeerdereProductenGebruikt(foto.id, shopifyProductId, token);
+
+    if (gedeeld) {
+      console.log(`  ⏭️  Foto overgeslagen — gedeeld met andere producten`);
       aantalOvergeslagen++;
       continue;
     }
@@ -282,19 +257,15 @@ async function verwerkNieuwProduct(productData) {
     }
 
     // Bestandsnaam aanpassen
-    const extensie = mimeType === "image/png" ? ".png" : mimeType === "image/webp" ? ".webp" : ".jpg";
     const bestandsResultaat = await pasBestandsnaamAan(foto.id, nieuweNaam, foto.mimeType, token);
     if (bestandsResultaat?.userErrors?.length > 0) {
       console.log(`  ❌ Bestandsnaam fout: ${bestandsResultaat.userErrors[0].message}`);
-      console.log(`  ℹ️  Tip: controleer of write_files is toegevoegd aan de app-rechten`);
+      console.log(`  ℹ️  Controleer of write_files is toegevoegd aan de app-rechten`);
     } else {
       const ext = foto.mimeType === "image/png" ? ".png" : foto.mimeType === "image/webp" ? ".webp" : ".jpg";
       console.log(`  ✅ Bestandsnaam: "${nieuweNaam}${ext}"`);
+      aantalGelukt++;
     }
-
-    // Onthoud deze foto — nooit meer aanraken
-    reedsAangepasteFotos.add(foto.id);
-    aantalGelukt++;
   }
 
   console.log(`\n🎉 Klaar! ${aantalGelukt} foto('s) bijgewerkt, ${aantalOvergeslagen} overgeslagen voor "${producttitel}"`);
@@ -305,14 +276,11 @@ async function verwerkNieuwProduct(productData) {
 // ============================================================
 app.post("/webhook/product-created", async (req, res) => {
   const handtekening = req.headers["x-shopify-hmac-sha256"];
-
   if (!isEchtShopifyBericht(req.body, handtekening)) {
     console.log("⚠️  Ongeldig bericht — genegeerd");
     return res.status(401).send("Ongeautoriseerd");
   }
-
   res.status(200).send("Ontvangen!");
-
   try {
     const productData = JSON.parse(req.body.toString());
     await verwerkNieuwProduct(productData);
@@ -323,26 +291,19 @@ app.post("/webhook/product-created", async (req, res) => {
 
 // Test-pagina
 app.get("/", (req, res) => {
-  const shopIngesteld = SHOPIFY_SHOP_DOMAIN ? "✅" : "⚠️  Nog niet ingesteld";
-  const clientIdIngesteld = SHOPIFY_CLIENT_ID ? "✅" : "⚠️  Nog niet ingesteld";
-  const clientSecretIngesteld = SHOPIFY_CLIENT_SECRET ? "✅" : "⚠️  Nog niet ingesteld";
-
   res.send(`
     <h1>✅ Sportbrillenshop Alt Tag + Bestandsnaam Helper werkt!</h1>
-    <h2>Status:</h2>
-    <p>${shopIngesteld} Winkel: ${SHOPIFY_SHOP_DOMAIN || "niet ingesteld"}</p>
-    <p>${clientIdIngesteld} Client ID</p>
-    <p>${clientSecretIngesteld} Client Secret</p>
-    <p>🧠 Foto's onthouden in geheugen: ${reedsAangepasteFotos.size}</p>
+    <p>${SHOPIFY_SHOP_DOMAIN ? "✅" : "⚠️"} Winkel: ${SHOPIFY_SHOP_DOMAIN || "niet ingesteld"}</p>
+    <p>${SHOPIFY_CLIENT_ID ? "✅" : "⚠️"} Client ID</p>
+    <p>${SHOPIFY_CLIENT_SECRET ? "✅" : "⚠️"} Client Secret</p>
     <h2>Webhook URL:</h2>
     <p><code>${req.protocol}://${req.get("host")}/webhook/product-created</code></p>
   `);
 });
 
-// Start
 const POORT = process.env.PORT || 3000;
 app.listen(POORT, () => {
-  console.log(`\n🚀 Alt Tag + Bestandsnaam Helper gestart op poort ${POORT}`);
+  console.log(`\n🚀 Alt Tag + Bestandsnaam Helper v6 gestart op poort ${POORT}`);
   console.log(`🏪 Winkel: ${SHOPIFY_SHOP_DOMAIN || "⚠️  Nog niet ingesteld"}`);
   console.log(`🔑 Client ID: ${SHOPIFY_CLIENT_ID ? "✅" : "⚠️  Nog niet ingesteld"}`);
   console.log(`\nKlaar!\n`);
