@@ -1,6 +1,6 @@
 // ============================================================
 // Sportbrillenshop - Alt Tag + Bestandsnaam Updater
-// Versie 8 - met uitgebreide logging voor references debug
+// Versie 9 - alleen foto's zonder alt tag worden aangepast
 // ============================================================
 
 const express = require("express");
@@ -67,7 +67,7 @@ async function graphql(query, variables, token) {
 }
 
 // ============================================================
-// STAP 1: Foto's ophalen van product
+// STAP 1: Foto's ophalen van product inclusief alt tag
 // ============================================================
 async function haalFotos(productId, token) {
   const data = await graphql(`
@@ -79,9 +79,9 @@ async function haalFotos(productId, token) {
             node {
               id
               mediaContentType
+              alt
               ... on MediaImage {
                 mimeType
-                alt
               }
             }
           }
@@ -93,57 +93,7 @@ async function haalFotos(productId, token) {
 }
 
 // ============================================================
-// STAP 2: Controleer references - MET VOLLEDIGE LOGGING
-// ============================================================
-async function isGedeeldeFoto(mediaId, token) {
-  const data = await graphql(`
-    query($id: ID!) {
-      node(id: $id) {
-        ... on MediaImage {
-          id
-          references(first: 25) {
-            nodes {
-              __typename
-              ... on Product {
-                id
-                title
-              }
-              ... on ProductVariant {
-                id
-                title
-                product {
-                  id
-                  title
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  `, { id: mediaId }, token);
-
-  const nodes = data.data?.node?.references?.nodes || [];
-  
-  // Log alles wat Shopify teruggeeft — zo zien we precies wat er gebeurt
-  console.log(`  🔍 References ruwe data: ${JSON.stringify(nodes)}`);
-
-  // Verzamel unieke product IDs
-  const productIds = new Set();
-  for (const node of nodes) {
-    if (node.__typename === "Product") {
-      productIds.add(node.id);
-    } else if (node.__typename === "ProductVariant" && node.product?.id) {
-      productIds.add(node.product.id);
-    }
-  }
-
-  console.log(`  🔍 Unieke producten: ${productIds.size} → ${JSON.stringify([...productIds])}`);
-  return productIds.size > 1;
-}
-
-// ============================================================
-// STAP 3: Alt tag aanpassen
+// STAP 2: Alt tag aanpassen
 // ============================================================
 async function pasAltAan(productId, mediaId, naam, token) {
   const data = await graphql(`
@@ -165,7 +115,7 @@ async function pasAltAan(productId, mediaId, naam, token) {
 }
 
 // ============================================================
-// STAP 4: Bestandsnaam aanpassen
+// STAP 3: Bestandsnaam aanpassen
 // ============================================================
 async function pasBestandsnaamAan(mediaId, naam, mimeType, token) {
   let ext = ".jpg";
@@ -199,20 +149,20 @@ async function verwerk(productData) {
   const titel = productData.title;
   const naam = maakNaam(titel);
 
-  console.log(`\n🛍️  Product: "${titel}" (${productId})`);
+  console.log(`\n🛍️  Product: "${titel}"`);
   console.log(`📝 Wordt: "${naam}"`);
 
   const token = await haalToken();
 
-  // Wacht 5 seconden zodat Shopify foto's verwerkt heeft
-  await new Promise(r => setTimeout(r, 5000));
+  // Wacht 3 seconden zodat Shopify foto's verwerkt heeft
+  await new Promise(r => setTimeout(r, 3000));
 
   const product = await haalFotos(productId, token);
   if (!product) { console.log("❌ Product niet gevonden"); return; }
 
   const fotos = product.media?.edges || [];
   console.log(`📸 ${fotos.length} foto('s) gevonden`);
-  if (fotos.length === 0) { console.log("ℹ️  Geen foto's"); return; }
+  if (fotos.length === 0) { console.log("ℹ️  Geen foto's — wordt opgepakt zodra foto's worden toegevoegd"); return; }
 
   let gelukt = 0;
   let overgeslagen = 0;
@@ -221,10 +171,15 @@ async function verwerk(productData) {
     if (foto.mediaContentType !== "IMAGE") continue;
 
     console.log(`\n  🖼️  Foto: ${foto.id}`);
+    console.log(`  📌 Huidige alt tag: "${foto.alt || "(leeg)"}"`);
 
-    const gedeeld = await isGedeeldeFoto(foto.id, token);
-    if (gedeeld) {
-      console.log(`  ⏭️  Overgeslagen — gedeeld`);
+    // ============================================================
+    // SLIMME CHECK: alleen foto's zonder alt tag worden aangepast
+    // Als een foto al een alt tag heeft → is hij al eerder verwerkt
+    // of wordt hij door meerdere producten gebruikt → overslaan!
+    // ============================================================
+    if (foto.alt && foto.alt.trim() !== "") {
+      console.log(`  ⏭️  Overgeslagen — heeft al een alt tag`);
       overgeslagen++;
       continue;
     }
@@ -238,7 +193,7 @@ async function verwerk(productData) {
 }
 
 // ============================================================
-// WEBHOOK
+// WEBHOOKS
 // ============================================================
 app.post("/webhook/product-created", async (req, res) => {
   if (!isEchtShopify(req.body, req.headers["x-shopify-hmac-sha256"])) {
@@ -252,19 +207,33 @@ app.post("/webhook/product-created", async (req, res) => {
   }
 });
 
+app.post("/webhook/product-updated", async (req, res) => {
+  if (!isEchtShopify(req.body, req.headers["x-shopify-hmac-sha256"])) {
+    return res.status(401).send("Ongeautoriseerd");
+  }
+  res.status(200).send("Ontvangen!");
+  try {
+    await verwerk(JSON.parse(req.body.toString()));
+  } catch (e) {
+    console.error("❌ Fout:", e.message);
+  }
+});
+
 app.get("/", (req, res) => {
   res.send(`
-    <h1>✅ Sportbrillenshop Helper v8</h1>
+    <h1>✅ Sportbrillenshop Helper v9</h1>
     <p>${SHOPIFY_SHOP_DOMAIN ? "✅" : "❌"} ${SHOPIFY_SHOP_DOMAIN || "niet ingesteld"}</p>
     <p>${SHOPIFY_CLIENT_ID ? "✅" : "❌"} Client ID</p>
     <p>${SHOPIFY_CLIENT_SECRET ? "✅" : "❌"} Client Secret</p>
-    <code>${req.protocol}://${req.get("host")}/webhook/product-created</code>
+    <h2>Webhook URLs:</h2>
+    <p><code>${req.protocol}://${req.get("host")}/webhook/product-created</code></p>
+    <p><code>${req.protocol}://${req.get("host")}/webhook/product-updated</code></p>
   `);
 });
 
 const POORT = process.env.PORT || 3000;
 app.listen(POORT, () => {
-  console.log(`\n🚀 v8 gestart op poort ${POORT}`);
+  console.log(`\n🚀 v9 gestart op poort ${POORT}`);
   console.log(`🏪 ${SHOPIFY_SHOP_DOMAIN || "❌ niet ingesteld"}`);
   console.log(`🔑 ${SHOPIFY_CLIENT_ID ? "✅" : "❌"}\n`);
 });
